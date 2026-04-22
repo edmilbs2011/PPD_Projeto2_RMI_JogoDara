@@ -102,18 +102,20 @@ class AplicacaoServidor:
         with self._lock:
             msgs: List[dict] = []
 
+            # Buffer de mensagens pendentes (chat e STATE final de fim de partida).
+            # Processado antes de GAME_OVER para garantir que o tabuleiro seja
+            # atualizado no cliente antes da notificação de fim de jogo.
+            chats = self._chats.get(id_cliente, [])
+            if chats:
+                msgs.extend(chats)
+                self._chats[id_cliente] = []
+
             # GAME_OVER é transitório: após partida_atual = None o estado
             # não pode mais ser derivado, por isso é guardado até ser lido.
             resultado = self._resultados.get(id_cliente)
             if resultado is not None:
                 msgs.append({"type": "GAME_OVER", "payload": resultado})
                 self._resultados[id_cliente] = None
-
-            # Chat: broadcast inevitável, não deriva do estado do jogo.
-            chats = self._chats.get(id_cliente, [])
-            if chats:
-                msgs.extend(chats)
-                self._chats[id_cliente] = []
 
             # STATE ou LOBBY: derivados ao vivo do estado atual.
             # Só enviados quando algo mudou desde o último poll do cliente.
@@ -332,7 +334,16 @@ class AplicacaoServidor:
 
         if regras.contar_pecas_do_jogador(p.tabuleiro, id_oponente) <= 2:
             vencedor = p.jogadores_por_identificador[jogador.identificador_jogador].apelido
-            return self._encerrar_partida(vencedor, "oponente com duas peças", jogador.identificador_cliente)
+            # Constrói STATE final com o tabuleiro já atualizado (peça removida)
+            # antes de encerrar a partida (que anula partida_atual).
+            estado_caller = self._msg_state(jogador)
+            jogador_oponente = p.jogadores_por_identificador[id_oponente]
+            estado_oponente = self._msg_state(jogador_oponente)
+            # Entrega STATE final ao oponente via buffer antes do GAME_OVER
+            self._chats.setdefault(jogador_oponente.identificador_cliente, []).append(estado_oponente)
+            return [estado_caller] + self._encerrar_partida(
+                vencedor, "oponente com duas peças", jogador.identificador_cliente
+            )
 
         fim = self._verificar_sem_movimentos(jogador)
         if fim is not None:

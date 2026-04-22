@@ -286,7 +286,7 @@ class AplicacaoTk:
             self._redesenhar()
             return
 
-        self._raiz.after(50, self._ciclo_rede)
+        self._raiz.after(200, self._ciclo_rede)
 
     # ================================================================== #
     #  TRATAMENTO DE MENSAGENS RECEBIDAS                                  #
