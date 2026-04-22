@@ -1,0 +1,5 @@
+# Dependências externas
+Pyro5>=5.16      # RMI — comunicação cliente/servidor
+serpent>=1.42    # Serialização usada pelo Pyro5 (instalada automaticamente)
+
+# tkinter vem incluído na instalação padrão do Python 3.
