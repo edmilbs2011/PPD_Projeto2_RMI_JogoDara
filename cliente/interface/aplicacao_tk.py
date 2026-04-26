@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import threading
 import tkinter as tk
+import uuid
 from tkinter import messagebox
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -8,37 +10,63 @@ import Pyro5.api
 
 from cliente.interface.tabuleiro_canvas import TabuleiroCanvas
 from cliente.interface.prateleira_pecas import PrateleiraDePecas
+from compartilhado.interfaces import InterfaceClienteCallback
 
 Celula = Tuple[int, int]
 
 
+@Pyro5.api.expose
+class _ClienteCallback(InterfaceClienteCallback):
+    """
+    Objeto de callback do cliente exposto via Pyro5.
+    Registrado no servidor de nomes como 'dara.cliente.<uuid>'.
+
+    O servidor chama receber() neste objeto para empurrar notificações
+    (STATE, LOBBY, CHAT, GAME_OVER) sem que o cliente precise fazer polling.
+    Como receber() é invocado pela thread do Daemon Pyro5, o processamento
+    é agendado no thread principal do Tkinter via after(0, ...) para garantir
+    segurança de thread na interface gráfica.
+    """
+
+    def __init__(self, raiz: tk.Tk, processar_fn) -> None:
+        self._raiz = raiz
+        self._processar = processar_fn
+
+    def receber(self, msgs: List[dict]) -> None:
+        """Recebe mensagens empurradas pelo servidor e agenda processamento no thread Tkinter."""
+        self._raiz.after(0, lambda m=list(msgs): self._processar(m))
+
+
 class AplicacaoTk:
     """
-    Janela principal do cliente Dara — comunicação por RMI com Pyro5.
+    Janela principal do cliente Dara — RMI bidirecional via servidor de nomes Pyro5.
 
-    O cliente mantém um proxy Pyro5 que representa o objeto remoto no servidor.
-    Chamar um método no proxy é equivalente a chamar o método diretamente no
-    servidor, sem nenhuma codificação ou socket manual.
+    Toda comunicação ocorre por chamada remota direta, sem polling e sem buffer.
+    O servidor de nomes é o ponto central de descoberta para ambos os lados.
+
+    CONEXÃO (diálogo → servidor de nomes → proxy):
+        1. Usuário informa nickname, host e porta do servidor de nomes.
+        2. Cliente cria _ClienteCallback e o registra no NS como 'dara.cliente.<uuid>'.
+        3. Daemon Pyro5 local sobe em thread de background para receber callbacks.
+        4. ns.lookup("jogo.dara") retorna a URI do daemon do jogo.
+        5. proxy.hello(apelido, nome_callback) registra o jogador no servidor,
+           que por sua vez resolve o callback no NS e armazena a URI.
 
     ENVIO (clique → servidor):
         1. tabuleiro_canvas captura o clique do mouse e converte pixel → (linha, coluna).
-        2. Entrega as coordenadas para _ao_clicar_tabuleiro() desta classe.
-        3. aplicacao_tk chama o método correspondente no proxy:
+        2. aplicacao_tk chama o método correspondente no proxy:
                self._servidor.colocar(self._id_cliente, linha, coluna)
-        4. Pyro5 serializa, transporta e executa o método no servidor.
-        5. O retorno (STATE ou ERROR) é processado imediatamente por _processar_respostas().
+        3. Pyro5 serializa, transporta e executa o método no servidor.
+        4. O retorno (STATE ou ERROR) é processado imediatamente por _processar_respostas().
 
-    RECEBIMENTO (servidor → tela):
-        1. _ciclo_rede() é chamado pelo Tkinter a cada 50 ms.
-        2. Chama self._servidor.obter_estado(self._id_cliente).
-        3. O servidor deriva o estado atual do jogo (sem fila) e retorna
-           dicts de GAME_OVER, CHAT ou STATE/LOBBY quando algo mudou.
+    RECEBIMENTO (servidor → cliente, RMI inverso):
+        1. O servidor chama receber() no objeto _ClienteCallback via proxy Pyro5.
+        2. O Daemon local recebe a chamada na thread de background.
+        3. _ClienteCallback.receber() agenda _processar_respostas() no thread Tkinter.
         4. aplicacao_tk interpreta cada dict e atualiza a interface.
 
-    Os métodos de ação (colocar, mover, capturar, pronto, etc.) processam
-    o retorno do servidor imediatamente via _processar_respostas(), sem
-    esperar o próximo ciclo de polling. O ciclo obter_estado() permanece
-    apenas para notificar o jogador que aguarda a vez do oponente.
+    Não há polling (_ciclo_rede foi removido). Toda notificação do servidor
+    ao cliente é uma chamada RMI direta resolvida pelo servidor de nomes.
     """
 
     def __init__(self, raiz: tk.Tk) -> None:
@@ -50,6 +78,12 @@ class AplicacaoTk:
         # Proxy Pyro5 para o objeto remoto no servidor
         self._servidor: Optional[Pyro5.api.Proxy] = None
         self._id_cliente: str = ""
+
+        # Daemon local que expõe o callback ao servidor
+        self._daemon_callback: Optional[Pyro5.api.Daemon] = None
+        self._nome_callback: str = ""
+        self._ns_host: str = "localhost"
+        self._ns_porta: int = 9090
 
         # Estado local do jogo
         self._id_jogador: int = 0
@@ -178,22 +212,22 @@ class AplicacaoTk:
 
         var_nick = tk.StringVar(value="")
         var_host = tk.StringVar(value="localhost")
-        var_port = tk.StringVar(value="9000")
+        var_port = tk.StringVar(value="9090")
 
         tk.Label(dlg, text="Nickname", **lbl_cfg).pack(anchor="w", padx=14, pady=(14, 0))
         campo_nick = tk.Entry(dlg, textvariable=var_nick, **ent_cfg)
         campo_nick.pack(fill="x", padx=14)
 
-        tk.Label(dlg, text="Host / IP do servidor", **lbl_cfg).pack(anchor="w", padx=14, pady=(8, 0))
+        tk.Label(dlg, text="Host / IP do servidor de nomes", **lbl_cfg).pack(anchor="w", padx=14, pady=(8, 0))
         tk.Entry(dlg, textvariable=var_host, **ent_cfg).pack(fill="x", padx=14)
 
-        tk.Label(dlg, text="Porta", **lbl_cfg).pack(anchor="w", padx=14, pady=(8, 0))
+        tk.Label(dlg, text="Porta do servidor de nomes", **lbl_cfg).pack(anchor="w", padx=14, pady=(8, 0))
         tk.Entry(dlg, textvariable=var_port, **ent_cfg).pack(fill="x", padx=14)
 
         def conectar():
             nick = var_nick.get().strip()
             host = var_host.get().strip()
-            porta = int(var_port.get().strip() or "9000")
+            porta = int(var_port.get().strip() or "9090")
             if not nick:
                 messagebox.showwarning("Aviso", "Informe um nickname.")
                 return
@@ -209,29 +243,58 @@ class AplicacaoTk:
         dlg.protocol("WM_DELETE_WINDOW", lambda: self._raiz.destroy())
 
     # ================================================================== #
-    #  CONEXÃO — cria o proxy e chama hello() diretamente no servidor    #
+    #  CONEXÃO — callback no NS + proxy do servidor via NS               #
     # ================================================================== #
 
-    def _conectar(self, host: str, porta: int, apelido: str) -> None:
+    def _conectar(self, ns_host: str, ns_porta: int, apelido: str) -> None:
         """
-        Cria o proxy Pyro5 e chama hello() no objeto remoto.
+        Registra o callback no NS, sobe o Daemon local e conecta ao servidor.
 
         Fluxo:
-            1. Instancia Pyro5.api.Proxy com a URI do servidor.
-            2. Chama proxy.hello(apelido) — executa remotamente no servidor.
-            3. O retorno é o dict WELCOME com id_cliente, you, nickname.
-            4. Armazena id_cliente e atualiza a interface.
-            5. Inicia o ciclo de polling _ciclo_rede().
+            1. Cria _ClienteCallback e o registra em um Daemon Pyro5 local.
+            2. Publica a URI do callback no NS como 'dara.cliente.<uuid>'.
+            3. Inicia o Daemon em thread de background para receber chamadas.
+            4. Resolve 'jogo.dara' no NS para obter a URI do servidor.
+            5. Chama proxy.hello(apelido, nome_callback) — o servidor resolve
+               o callback no NS e armazena a URI para notificações futuras.
+            6. Processa o retorno WELCOME e atualiza a interface.
         """
         self._apelido = apelido
+        self._ns_host = ns_host
+        self._ns_porta = ns_porta
         self._var_status.set("Conectando...")
-        self._log(f"Conectando em PYRO:jogo.dara@{host}:{porta}...")
+        self._log(f"Consultando servidor de nomes em {ns_host}:{ns_porta}...")
 
         try:
-            self._servidor = Pyro5.api.Proxy(f"PYRO:jogo.dara@{host}:{porta}")
-            resultado = self._servidor.hello(apelido)
+            # Registrar callback no NS para que o servidor possa chamar de volta
+            self._daemon_callback = Pyro5.api.Daemon()
+            callback = _ClienteCallback(self._raiz, self._processar_respostas)
+            uri_callback = self._daemon_callback.register(callback)
+
+            ns = Pyro5.api.locate_ns(host=ns_host, port=ns_porta)
+            self._nome_callback = f"dara.cliente.{uuid.uuid4()}"
+            ns.register(self._nome_callback, uri_callback)
+            ns._pyroRelease()
+            self._log(f"Callback registrado no NS como '{self._nome_callback}'")
+
+            threading.Thread(
+                target=self._daemon_callback.requestLoop, daemon=True,
+            ).start()
+
+            # Resolver o servidor no NS e criar proxy
+            ns2 = Pyro5.api.locate_ns(host=ns_host, port=ns_porta)
+            uri_servidor = ns2.lookup("jogo.dara")
+            ns2._pyroRelease()
+            self._log(f"Servidor encontrado: {uri_servidor}")
+
+            self._servidor = Pyro5.api.Proxy(uri_servidor)
+            resultado = self._servidor.hello(apelido, self._nome_callback)
+
         except Exception as e:
             self._servidor = None
+            if self._daemon_callback:
+                self._daemon_callback.shutdown()
+                self._daemon_callback = None
             self._var_status.set("Erro de conexão")
             self._log(f"ERRO: {e}")
             messagebox.showerror("Erro", f"Não foi possível conectar: {e}")
@@ -245,48 +308,17 @@ class AplicacaoTk:
             messagebox.showerror("Erro", msg)
             self._servidor._pyroRelease()
             self._servidor = None
+            if self._daemon_callback:
+                self._daemon_callback.shutdown()
+                self._daemon_callback = None
             return
 
         payload = resultado.get("payload", {})
         self._id_cliente = payload.get("id_cliente", "")
         self._var_status.set("Conectado")
-        self._log("Conexão RMI estabelecida.")
+        self._log("Conexão RMI estabelecida via servidor de nomes.")
         self._ao_welcome(payload)
-        self._raiz.after(50, self._ciclo_rede)
-
-    # ================================================================== #
-    #  CICLO DE REDE — polling via chamada remota a cada 50 ms           #
-    # ================================================================== #
-
-    def _ciclo_rede(self) -> None:
-        """
-        Polling chamado pelo Tkinter a cada 50ms.
-
-        Fluxo:
-            1. Chama self._servidor.obter_estado(self._id_cliente) — RMI.
-            2. O servidor deriva o estado atual do jogo diretamente (sem fila) e
-               retorna sempre STATE ou LOBBY, mais GAME_OVER e CHAT se houver pendentes.
-            3. Para cada dict recebido, chama _tratar_mensagem().
-            4. Reagenda o próximo ciclo.
-        """
-        if self._servidor is None:
-            self._var_status.set("Desconectado")
-            self._canvas.atualizar_status(status_conexao="Desconectado")
-            self._redesenhar()
-            return
-
-        try:
-            mensagens = self._servidor.obter_estado(self._id_cliente)
-            for msg in mensagens:
-                self._tratar_mensagem(msg)
-        except Exception:
-            self._servidor = None
-            self._var_status.set("Desconectado")
-            self._canvas.atualizar_status(status_conexao="Desconectado")
-            self._redesenhar()
-            return
-
-        self._raiz.after(200, self._ciclo_rede)
+        # Sem _ciclo_rede — todas as atualizações chegam via callback RMI
 
     # ================================================================== #
     #  TRATAMENTO DE MENSAGENS RECEBIDAS                                  #
@@ -334,8 +366,7 @@ class AplicacaoTk:
         self._var_status.set(f"Sala: {nomes}")
 
     def _ao_start(self, p: Dict) -> None:
-        # O servidor não envia mais START; este método é mantido por
-        # compatibilidade caso alguma extensão futura o utilize.
+        # O servidor não envia mais START; mantido por compatibilidade.
         fase = p.get("phase", "")
         self._fase = fase
         self._partida_ativa = True
@@ -413,7 +444,8 @@ class AplicacaoTk:
         adequado diretamente no objeto remoto via proxy Pyro5.
 
         O retorno do servidor (STATE ou ERROR) é processado imediatamente
-        por _processar_respostas(), sem aguardar o próximo ciclo de polling.
+        por _processar_respostas(). O oponente é notificado pelo servidor
+        via chamada RMI ao seu callback — sem polling.
         """
         if not self._partida_ativa or self._servidor is None:
             return
@@ -442,7 +474,7 @@ class AplicacaoTk:
 
         Primeiro clique: seleciona a peça (se for do jogador) e calcula destinos válidos.
         Segundo clique: se for destino válido, chama mover() no servidor e processa
-        o retorno (STATE ou ERROR) imediatamente via _processar_respostas().
+        o retorno imediatamente via _processar_respostas().
         Clique inválido: deseleciona e redesenha.
         """
         if self._celula_selecionada and (linha, coluna) in self._destinos_validos:
@@ -478,7 +510,11 @@ class AplicacaoTk:
     # ================================================================== #
 
     def _processar_respostas(self, msgs: list) -> None:
-        """Processa a lista de dicts retornada diretamente pelo servidor."""
+        """
+        Processa lista de dicts recebida do servidor.
+        Chamado tanto pelo retorno direto de ações (thread Tkinter) quanto
+        pelo callback RMI agendado via after(0, ...) (thread Daemon → Tkinter).
+        """
         for msg in (msgs or []):
             self._tratar_mensagem(msg)
 
@@ -514,13 +550,27 @@ class AplicacaoTk:
     # ================================================================== #
 
     def _ao_fechar(self) -> None:
-        """Notifica o servidor sobre a desconexão antes de encerrar a janela."""
+        """
+        Desconecta do servidor, remove o callback do NS e encerra o Daemon local.
+        """
         if self._servidor and self._id_cliente:
             try:
                 self._servidor.desconectar(self._id_cliente)
             except Exception:
                 pass
             self._servidor._pyroRelease()
+
+        if self._nome_callback:
+            try:
+                ns = Pyro5.api.locate_ns(host=self._ns_host, port=self._ns_porta)
+                ns.remove(self._nome_callback)
+                ns._pyroRelease()
+            except Exception:
+                pass
+
+        if self._daemon_callback:
+            self._daemon_callback.shutdown()
+
         self._raiz.destroy()
 
     # ================================================================== #

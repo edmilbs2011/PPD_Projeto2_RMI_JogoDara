@@ -2,20 +2,41 @@
 
 Implementação do Jogo de Tabuleiro **Dara** (origem africana — Nigéria) com
 comunicação **Cliente/Servidor via RMI (Remote Method Invocation)** usando a
-biblioteca **Pyro5**, sem socket manual, sem JSONL e sem fila de mensagens.
-UI gráfica em **Tkinter (Canvas)**.
+biblioteca **Pyro5**, com **RMI bidirecional** e resolução de endereços via
+**Servidor de Nomes Pyro5**. UI gráfica em **Tkinter (Canvas)**.
 
 Disciplina: **Programação Paralela e Distribuída** — Engenharia da Computação — IFCE.
 
 ---
 
-## Arquitetura — RMI com Pyro5 (sem fila, sem barramento de eventos)
+## Arquitetura — RMI Bidirecional via Servidor de Nomes
 
-O servidor expõe um único objeto Python (`AplicacaoServidor`) via Pyro5.
-O cliente obtém um **proxy** desse objeto e chama seus métodos diretamente,
-como se fossem chamadas locais. O Pyro5 cuida de toda a serialização e transporte.
+Toda comunicação ocorre por chamada remota direta, sem polling e sem buffer.
+O servidor de nomes é o ponto central de descoberta para **ambos os lados**:
 
-### Fluxo de ENVIO (clique do mouse → servidor)
+- O **servidor do jogo** registra `"jogo.dara"` → URI do daemon do jogo.
+- Cada **cliente** registra `"dara.cliente.<uuid>"` → URI do seu objeto de callback.
+
+O servidor resolve os contratos em duas direções:
+
+| Direção | Quem chama | O quê chama | Como descobre |
+|---|---|---|---|
+| Cliente → Servidor | `aplicacao_tk` | métodos de `InterfaceServidor` | `ns.lookup("jogo.dara")` |
+| Servidor → Cliente | `AplicacaoServidor` | `InterfaceClienteCallback.receber()` | `ns.lookup("dara.cliente.<uuid>")` |
+
+### Fluxo de CONEXÃO (diálogo → NS → proxy bidirecional)
+
+```
+1. Usuário informa nickname, host e porta do servidor de nomes
+2. Cliente cria _ClienteCallback e o registra no Daemon Pyro5 local
+3. ns.register("dara.cliente.<uuid>", uri_callback) publica o callback no NS
+4. Daemon local sobe em thread de background para receber chamadas do servidor
+5. ns.lookup("jogo.dara") retorna a URI do daemon do jogo
+6. proxy.hello(apelido, "dara.cliente.<uuid>") registra o jogador no servidor
+7. Servidor faz ns.lookup("dara.cliente.<uuid>") e armazena o proxy do callback
+```
+
+### Fluxo de ENVIO (clique → servidor, cliente → servidor)
 
 ```
 1. tabuleiro_canvas captura o clique do mouse (<Button-1>)
@@ -26,74 +47,93 @@ como se fossem chamadas locais. O Pyro5 cuida de toda a serialização e transpo
 5. O retorno (lista de dicts) é processado imediatamente por _processar_respostas()
 ```
 
-### Fluxo de RECEBIMENTO — jogador que aguarda a vez do oponente
+### Fluxo de RECEBIMENTO (servidor → cliente, RMI inverso)
 
 ```
-1. _ciclo_rede() é chamado pelo Tkinter a cada 50 ms
-2. Chama self._servidor.obter_estado(id_cliente)
-3. O servidor deriva o estado atual do jogo diretamente (sem fila) e retorna
-   STATE ou LOBBY; se houver pendentes, inclui GAME_OVER e/ou CHAT
-4. aplicacao_tk chama _tratar_mensagem() para cada dict e atualiza a tela
+1. Servidor conclui uma ação (colocar, mover, capturar, chat, game_over...)
+2. Resolve a URI do callback do outro jogador (já armazenada desde o hello())
+3. Chama proxy_callback.receber([msgs]) — chamada RMI direta ao cliente
+4. Daemon local do cliente recebe a chamada na thread de background
+5. _ClienteCallback.receber() agenda _processar_respostas() via after(0, ...)
+6. Thread principal do Tkinter processa as mensagens e atualiza a interface
 ```
 
-### Por que dois mini-buffers ainda existem no servidor
-
-| Buffer | Motivo |
-|---|---|
-| `_resultados` (GAME_OVER) | Quando a partida encerra, `partida_atual = None` e o estado não pode mais ser derivado. O GAME_OVER fica guardado até o outro jogador fazer polling. |
-| `_chats` (mensagens de chat) | Chat é broadcast e não pode ser reconstruído a partir do estado do jogo.|
+Não há polling, não há buffer. Cada evento chega ao destino no momento em que ocorre.
 
 ### Diagrama
 
 ```
-┌────────────────────────── CLIENTE ────────────────────────────┐
+┌────────────────────────── CLIENTE A ──────────────────────────┐
+│                                                               │
+│  [ Diálogo de Conexão ]                                       │
+│      registra "dara.cliente.uuid-A" no NS                     │
+│      resolve "jogo.dara" no NS → proxy do servidor            │
+│      hello(apelido, "dara.cliente.uuid-A")                    │
 │                                                               │
 │  [ tabuleiro_canvas ]                                         │
-│      │  clique (pixel)                                        │
-│      │  _pixel_para_celula() → (linha, coluna)                │
-│      ▼  callback registrado em vincular_clique()              │
-│  [ aplicacao_tk ]                                             │
-│      │  self._servidor.colocar(id_cliente, linha, coluna)     │
-│      │         ──── chamada direta via proxy Pyro5 ────       │
+│      clique → _pixel_para_celula() → (linha, coluna)          │
 │      ▼                                                        │
-│  RMI retorna List[dict] imediatamente                         │
-│      │                                                        │
-│      ▼  _processar_respostas()                                │
-│  [ aplicacao_tk._tratar_mensagem() ]                          │
-│      atualiza estado local e chama tabuleiro_canvas.renderizar│
-│                                                               │
-│  [ _ciclo_rede() — a cada 50 ms ]                             │
-│      self._servidor.obter_estado(id_cliente)                  │
-│      ─── notifica o jogador que aguarda a vez do oponente ─── │
+│  [ aplicacao_tk ]                          [ _ClienteCallback ]
+│      │  proxy.colocar(id, linha, coluna)       ▲  receber()  │
+│      │  ──── RMI: cliente → servidor ────      │  RMI inverso│
+│      ▼  retorno imediato (STATE/ERROR)          │             │
+│  _processar_respostas() → atualiza UI          │             │
+│                                                │             │
+│  [ Daemon Pyro5 local — thread background ] ───┘             │
 │                                                               │
 └───────────────────────────────────────────────────────────────┘
-
+                          │  ▲
+        RMI cliente→server │  │ RMI server→cliente (callback)
+                          ▼  │
+┌─────────────────── SERVIDOR DE NOMES ─────────────────────────┐
+│  [ Pyro5 Name Server ]                                        │
+│      "jogo.dara"             → URI do daemon do jogo          │
+│      "dara.cliente.uuid-A"   → URI do callback do cliente A   │
+│      "dara.cliente.uuid-B"   → URI do callback do cliente B   │
+└───────────────────────────────────────────────────────────────┘
+                          │  ▲
+                          ▼  │
 ┌────────────────────────── SERVIDOR ───────────────────────────┐
 │                                                               │
-│  [ AplicacaoServidor ] — objeto único (instance_mode=single)  │
-│      │  recebe chamada RMI (thread Pyro5)                     │
-│      │  adquire _lock (threading.Lock)                        │
-│      │  valida e executa regras do domínio                    │
-│      │  incrementa _versao a cada mudança de estado           │
-│      │  retorna List[dict] diretamente ao chamador            │
-│      ▼                                                        │
-│  obter_estado(id_cliente, versao_cliente=-1)                  │
-│      só inclui STATE/LOBBY quando _versao > versao_cliente    │
-│      esvazia _resultados e _chats pendentes se houver         │
+│  [ AplicacaoServidor ] — instância única                      │
+│      registra "jogo.dara" no NS ao iniciar                    │
+│      recebe chamada RMI → adquire _lock → valida e executa    │
+│      retorna List[dict] ao chamador (retorno direto)          │
+│      chama receber() no callback do outro jogador (RMI inv.)  │
+│                                                               │
+│  Sem obter_estado(), sem _resultados, sem _chats              │
 │                                                               │
 └───────────────────────────────────────────────────────────────┘
 ```
 
-### Protocolo de mensagens (tipos de retorno)
+### Protocolo de mensagens
 
-| Tipo | Quando | Quem recebe |
+| Tipo | Quando | Como chega ao destino |
 |---|---|---|
-| `WELCOME` | Retorno de `hello()` | Chamador |
-| `LOBBY` | `pronto()`, `obter_estado()` sem partida | Chamador |
-| `STATE` | Qualquer ação de jogo bem-sucedida | Chamador (imediato) e outro jogador (via polling) |
-| `ERROR` | Ação inválida (vez errada, casa ocupada, etc.) | Chamador |
-| `GAME_OVER` | Fim de partida | Chamador (imediato) + outro jogador (via `_resultados`) |
-| `CHAT` | `obter_estado()` quando há mensagens pendentes | Cada jogador (via `_chats`) |
+| `WELCOME` | Retorno de `hello()` | Valor de retorno direto (chamador) |
+| `LOBBY` | Conexão, `pronto()`, `desconectar()` | Retorno direto (chamador) + `receber()` (outros) |
+| `STATE` | Qualquer ação de jogo bem-sucedida | Retorno direto (chamador) + `receber()` (oponente) |
+| `ERROR` | Ação inválida (vez errada, casa ocupada, etc.) | Valor de retorno direto (chamador) |
+| `GAME_OVER` | Fim de partida | Retorno direto (chamador) + `receber()` (oponente) |
+| `CHAT` | `chat()` | `receber()` no callback do oponente (RMI direto) |
+
+### Contratos RMI (`compartilhado/interfaces.py`)
+
+```python
+class InterfaceServidor:          # registrado como "jogo.dara"
+    def hello(apelido, nome_callback) -> dict
+    def colocar(id_cliente, linha, coluna) -> List[dict]
+    def mover(id_cliente, fr, fc, tr, tc) -> List[dict]
+    def capturar(id_cliente, linha, coluna) -> List[dict]
+    def pronto(id_cliente) -> List[dict]
+    def desistir(id_cliente) -> List[dict]
+    def nova_partida(id_cliente) -> List[dict]
+    def chat(id_cliente, texto) -> None
+    def desconectar(id_cliente) -> None
+
+class InterfaceClienteCallback:   # registrado como "dara.cliente.<uuid>"
+    def receber(msgs: List[dict]) -> None
+```
 
 ---
 
@@ -122,21 +162,51 @@ pip install Pyro5
 
 ## Como rodar
 
-### 1. Servidor
+### 1. Servidor de Nomes
+
+Deve ser iniciado **antes** do servidor do jogo e dos clientes.
+Por padrão escuta na porta `9090`.
 
 ```bash
-python -m servidor.principal --host 0.0.0.0 --port 9000
+python -m Pyro5.nameserver
 ```
 
-O servidor imprime a URI no formato:
+Para escutar em um IP específico (útil em rede local):
 
-```
-Servidor Dara RMI v2.0 iniciado
-URI: PYRO:jogo.dara@0.0.0.0:9000
-Clientes devem usar: PYRO:jogo.dara@<ip>:9000
+```bash
+python -m Pyro5.nameserver -n 0.0.0.0
 ```
 
-### 2. Cliente (em cada máquina)
+### 2. Servidor do Jogo
+
+```bash
+python -m servidor.principal
+```
+
+Argumentos disponíveis:
+
+| Argumento | Padrão | Descrição |
+|---|---|---|
+| `--host` | `localhost` | IP em que o daemon do jogo vai escutar |
+| `--port` | `9000` | Porta do daemon do jogo |
+| `--ns-host` | `localhost` | IP do servidor de nomes |
+| `--ns-port` | `9090` | Porta do servidor de nomes |
+
+Exemplo em rede local:
+
+```bash
+python -m servidor.principal --host 0.0.0.0 --ns-host 192.168.1.10
+```
+
+O servidor imprime no terminal:
+
+```
+Servidor Dara RMI v3.0 iniciado
+URI do daemon: PYRO:jogo.dara@0.0.0.0:9000
+Registrado no servidor de nomes (localhost:9090) como 'jogo.dara'
+```
+
+### 3. Cliente (em cada máquina)
 
 ```bash
 python -m cliente.principal
@@ -144,10 +214,12 @@ python -m cliente.principal
 
 No diálogo de conexão, informe:
 - **Nickname** — seu nome no jogo
-- **Host / IP do servidor** — endereço da máquina do servidor
-- **Porta** — padrão `9000`
+- **Host / IP do servidor de nomes** — endereço da máquina onde o servidor de nomes está rodando
+- **Porta do servidor de nomes** — padrão `9090`
 
-Clique em **Pronto** para sinalizar que está pronto para jogar.
+Clique em **Conectar**. O cliente registra seu callback no servidor de nomes, resolve
+o endereço do jogo e estabelece a conexão RMI bidirecional. Em seguida, clique em
+**Pronto** para sinalizar que está pronto para jogar.
 
 ---
 
@@ -169,8 +241,9 @@ Clique em **Pronto** para sinalizar que está pronto para jogar.
 ## Estrutura do Projeto
 
 ```
-PPD_Ptojeto2_RMI_JogoDara/
+PPD_Projeto2_RMI_JogoDara/
 ├── compartilhado/
+│   ├── interfaces.py           # Contratos RMI: InterfaceServidor e InterfaceClienteCallback
 │   ├── tipos_protocolo.py      # TipoMensagem (Literal type)
 │   └── erros.py                # Exceções do domínio
 ├── servidor/
@@ -178,11 +251,11 @@ PPD_Ptojeto2_RMI_JogoDara/
 │   │   ├── regras.py           # Regras do Dara (trinca, adjacência, movimentos legais)
 │   │   └── estado_partida.py   # Dataclasses JogadorConectado e Partida
 │   ├── aplicacao/
-│   │   └── aplicacao_servidor.py  # Objeto RMI exposto via Pyro5
-│   └── principal.py            # Ponto de entrada do servidor (Pyro5 Daemon)
+│   │   └── aplicacao_servidor.py  # Objeto RMI exposto via Pyro5 (InterfaceServidor)
+│   └── principal.py            # Daemon do jogo + registro no servidor de nomes
 ├── cliente/
 │   ├── interface/
-│   │   ├── aplicacao_tk.py     # Janela principal — proxy Pyro5 + lógica de UI
+│   │   ├── aplicacao_tk.py     # UI + _ClienteCallback (InterfaceClienteCallback) + proxy
 │   │   ├── tabuleiro_canvas.py # Canvas do tabuleiro + barra de status
 │   │   └── prateleira_pecas.py # Prateleira visual de peças
 │   └── principal.py            # Ponto de entrada do cliente

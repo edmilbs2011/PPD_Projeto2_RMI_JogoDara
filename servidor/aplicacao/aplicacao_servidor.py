@@ -12,53 +12,65 @@ from servidor.dominio.estado_partida import (
     criar_nova_partida,
 )
 from servidor.dominio import regras
+from compartilhado.interfaces import InterfaceServidor
 
-VERSAO_DO_SERVIDOR = "2.0"
+VERSAO_DO_SERVIDOR = "3.0"
 
 
 @Pyro5.api.expose
 @Pyro5.api.behavior(instance_mode="single")
-class AplicacaoServidor:
+class AplicacaoServidor(InterfaceServidor):
     """
     Servidor do Jogo Dara exposto via RMI com Pyro5.
 
-    Cada método exposto retorna a resposta diretamente ao chamador como
-    valor de retorno Python. Não há fila de mensagens por cliente.
+    Toda comunicação ocorre por chamada remota direta — não há polling nem
+    broadcast via buffer. O servidor resolve o contrato em duas direções:
 
-    O cliente que fez a chamada recebe a resposta pelo retorno da função.
-    O outro jogador (não chamador) usa polling via obter_estado(), que
-    deriva o estado atual diretamente do jogo sem nenhuma fila.
+    Cliente → Servidor (InterfaceServidor):
+        O cliente chama métodos neste objeto para enviar ações de jogo.
+        Cada método retorna a resposta diretamente ao chamador.
 
-    Dois mini-buffers são mantidos:
-      _resultados : GAME_OVER por cliente — necessário porque partida_atual
-                    é zerado ao encerrar o jogo, tornando-o irrecuperável.
-      _chats      : mensagens de chat por cliente — necessário porque chat é
-                    broadcast; não há como derivá-lo do estado atual do jogo.
+    Servidor → Cliente (InterfaceClienteCallback):
+        Para notificar o outro jogador (que não fez a chamada atual), o servidor
+        resolve o nome 'dara.cliente.<uuid>' no servidor de nomes e chama
+        receber() no objeto de callback registrado pelo cliente.
+        Cada chamada de callback é disparada em thread separada para não
+        bloquear o lock enquanto a rede responde.
 
-    Para evitar redesenhos desnecessários a cada 50 ms, o servidor mantém
-    um contador _versao que é incrementado a cada mudança de estado.
-    obter_estado() só inclui STATE/LOBBY quando _versao > versao_cliente.
+    Não há obter_estado(), _resultados ou _chats — todos os eventos chegam
+    ao destino por chamada RMI direta no momento em que ocorrem.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, ns_host: str = "localhost", ns_porta: int = 9090) -> None:
         self._lock = threading.Lock()
+        self._ns_host = ns_host
+        self._ns_porta = ns_porta
         self.jogadores_por_cliente: Dict[str, JogadorConectado] = {}
         self.partida_atual: Optional[Partida] = None
         self._versao: int = 0
-        self._resultados: Dict[str, Optional[dict]] = {}   # GAME_OVER pendente
-        self._chats: Dict[str, List[dict]] = {}            # chat pendente
+        # Armazena URI (string) do callback de cada cliente, resolvida no hello().
+        # Usamos URI em vez de proxy porque proxies Pyro5 não são thread-safe;
+        # cada notificação cria seu próprio proxy efêmero na thread dedicada.
+        self._callbacks: Dict[str, str] = {}
 
     # ------------------------------------------------------------------ #
     #  Métodos expostos — retornam a resposta diretamente ao chamador    #
     # ------------------------------------------------------------------ #
 
-    def hello(self, apelido: str) -> dict:
+    def hello(self, apelido: str, nome_callback: str) -> dict:
         """
-        Registra o jogador. Retorna WELCOME ou ERROR diretamente.
-        O id_cliente do payload deve ser usado em todas as chamadas seguintes.
+        Registra o jogador e resolve o callback pelo servidor de nomes.
+
+        Fluxo:
+            1. Valida apelido e verifica slot disponível (1 ou 2).
+            2. Resolve 'nome_callback' no NS → obtém URI do objeto callback.
+            3. Armazena a URI para uso em notificações futuras.
+            4. Notifica jogadores já conectados sobre atualização do lobby.
+            5. Retorna WELCOME ao chamador.
         """
         with self._lock:
             apelido = str(apelido).strip()
+            nome_callback = str(nome_callback).strip()
             if not apelido:
                 return {"type": "ERROR", "payload": {"code": "BAD_NICK", "message": "Nickname obrigatório"}}
 
@@ -70,17 +82,32 @@ class AplicacaoServidor:
             else:
                 return {"type": "ERROR", "payload": {"code": "FULL", "message": "Servidor cheio (2 jogadores)."}}
 
+            # Resolve URI do callback no servidor de nomes
+            try:
+                ns = Pyro5.api.locate_ns(host=self._ns_host, port=self._ns_porta)
+                uri_callback = str(ns.lookup(nome_callback))
+                ns._pyroRelease()
+            except Exception as e:
+                return {"type": "ERROR", "payload": {
+                    "code": "CALLBACK_FAIL",
+                    "message": f"Não foi possível resolver callback '{nome_callback}': {e}",
+                }}
+
             id_cliente = str(uuid.uuid4())
             self.jogadores_por_cliente[id_cliente] = JogadorConectado(
                 identificador_cliente=id_cliente,
                 apelido=apelido,
                 identificador_jogador=id_jogador,
             )
-            self._resultados[id_cliente] = None
-            self._chats[id_cliente] = []
-
+            self._callbacks[id_cliente] = uri_callback
             self._versao += 1
             self._tentar_criar_partida()
+
+            # Notifica todos os jogadores já conectados sobre o lobby atualizado.
+            # Inclui o próprio novo jogador para que ele veja o estado inicial.
+            lobby = self._msg_lobby()
+            for uri in self._callbacks.values():
+                self._notificar(uri, [lobby])
 
             return {
                 "type": "WELCOME",
@@ -92,45 +119,12 @@ class AplicacaoServidor:
                 },
             }
 
-    def obter_estado(self, id_cliente: str, versao_cliente: int = -1) -> List[dict]:
-        """
-        Polling do outro jogador — deriva o estado atual sem usar fila.
-
-        Retorna apenas quando algo mudou (_versao > versao_cliente),
-        mais quaisquer GAME_OVER ou CHAT pendentes (inevitavelmente buffered).
-        """
-        with self._lock:
-            msgs: List[dict] = []
-
-            # Buffer de mensagens pendentes (chat e STATE final de fim de partida).
-            # Processado antes de GAME_OVER para garantir que o tabuleiro seja
-            # atualizado no cliente antes da notificação de fim de jogo.
-            chats = self._chats.get(id_cliente, [])
-            if chats:
-                msgs.extend(chats)
-                self._chats[id_cliente] = []
-
-            # GAME_OVER é transitório: após partida_atual = None o estado
-            # não pode mais ser derivado, por isso é guardado até ser lido.
-            resultado = self._resultados.get(id_cliente)
-            if resultado is not None:
-                msgs.append({"type": "GAME_OVER", "payload": resultado})
-                self._resultados[id_cliente] = None
-
-            # STATE ou LOBBY: derivados ao vivo do estado atual.
-            # Só enviados quando algo mudou desde o último poll do cliente.
-            if self._versao > versao_cliente:
-                if self.partida_atual:
-                    jogador = self.jogadores_por_cliente.get(id_cliente)
-                    if jogador:
-                        msgs.append(self._msg_state(jogador))
-                else:
-                    msgs.append(self._msg_lobby())
-
-            return msgs
-
     def pronto(self, id_cliente: str) -> List[dict]:
-        """Marca jogador como pronto. Retorna STATE (se partida iniciou) ou LOBBY."""
+        """
+        Marca jogador como pronto.
+        Notifica o oponente via callback com STATE (ambos prontos) ou LOBBY.
+        Retorna STATE ou LOBBY ao chamador.
+        """
         with self._lock:
             jogador = self.jogadores_por_cliente.get(id_cliente)
             if not jogador:
@@ -141,11 +135,14 @@ class AplicacaoServidor:
                 j2 = self.partida_atual.jogadores_por_identificador[2]
                 if j1.esta_pronto and j2.esta_pronto:
                     self._versao += 1
+                    self._notificar_oponente_state(jogador)
                     return [self._msg_state(jogador)]
+            # Ainda aguardando — notifica oponente sobre atualização do lobby
+            self._notificar_todos_exceto(id_cliente, [self._msg_lobby()])
             return [self._msg_lobby()]
 
     def colocar(self, id_cliente: str, linha: int, coluna: int) -> List[dict]:
-        """Coloca uma peça. Retorna STATE, ERROR ou [GAME_OVER, LOBBY]."""
+        """Coloca uma peça. Retorna STATE ou ERROR."""
         with self._lock:
             jogador = self.jogadores_por_cliente.get(id_cliente)
             if not self.partida_atual or not jogador:
@@ -153,7 +150,7 @@ class AplicacaoServidor:
             return self._tratar_colocacao(jogador, linha, coluna)
 
     def mover(self, id_cliente: str, fr: int, fc: int, tr: int, tc: int) -> List[dict]:
-        """Move uma peça. Retorna STATE, ERROR ou [GAME_OVER, LOBBY]."""
+        """Move uma peça. Retorna STATE ou ERROR."""
         with self._lock:
             jogador = self.jogadores_por_cliente.get(id_cliente)
             if not self.partida_atual or not jogador:
@@ -161,7 +158,7 @@ class AplicacaoServidor:
             return self._tratar_movimentacao(jogador, fr, fc, tr, tc)
 
     def capturar(self, id_cliente: str, linha: int, coluna: int) -> List[dict]:
-        """Captura uma peça. Retorna STATE, ERROR ou [GAME_OVER, LOBBY]."""
+        """Captura uma peça. Retorna STATE, ERROR ou [STATE, GAME_OVER, LOBBY]."""
         with self._lock:
             jogador = self.jogadores_por_cliente.get(id_cliente)
             if not self.partida_atual or not jogador:
@@ -169,7 +166,7 @@ class AplicacaoServidor:
             return self._tratar_captura(jogador, linha, coluna)
 
     def desistir(self, id_cliente: str) -> List[dict]:
-        """Declara desistência. Retorna [GAME_OVER, LOBBY] ou ERROR."""
+        """Declara desistência. Retorna [GAME_OVER, LOBBY] ao chamador."""
         with self._lock:
             jogador = self.jogadores_por_cliente.get(id_cliente)
             if not self.partida_atual or not jogador:
@@ -179,7 +176,7 @@ class AplicacaoServidor:
             return self._encerrar_partida(vencedor, "desistência", id_cliente)
 
     def nova_partida(self, id_cliente: str) -> List[dict]:
-        """Reinicia o jogo com os jogadores conectados. Retorna STATE ou ERROR."""
+        """Reinicia o jogo. Notifica o oponente via callback. Retorna STATE."""
         with self._lock:
             j1 = next((j for j in self.jogadores_por_cliente.values() if j.identificador_jogador == 1), None)
             j2 = next((j for j in self.jogadores_por_cliente.values() if j.identificador_jogador == 2), None)
@@ -190,43 +187,46 @@ class AplicacaoServidor:
             j2.esta_pronto = True
             self._versao += 1
             jogador = self.jogadores_por_cliente[id_cliente]
+            self._notificar_oponente_state(jogador)
             return [self._msg_state(jogador)]
 
     def chat(self, id_cliente: str, texto: str) -> None:
         """
-        Distribui mensagem de chat. Não retorna nada.
-        Chat é o único caso de broadcast inevitável: não pode ser derivado
-        do estado atual, então é buffered em _chats por cliente.
-        Funciona sempre que o remetente estiver conectado, independente de
-        haver partida ativa.
+        Envia mensagem de chat.
+        Chama receber() no callback do outro jogador via RMI — sem buffer.
         """
         with self._lock:
             jogador = self.jogadores_por_cliente.get(id_cliente)
             if not jogador:
                 return
             msg = {"type": "CHAT", "payload": {"from": jogador.apelido, "text": str(texto)}}
-            for id_c in self.jogadores_por_cliente:
-                if id_c != id_cliente:
-                    self._chats.setdefault(id_c, []).append(msg)
+            self._notificar_todos_exceto(id_cliente, [msg])
 
     def desconectar(self, id_cliente: str) -> None:
-        """Remove o jogador. Define GAME_OVER no _resultados do outro jogador."""
+        """
+        Remove o jogador e notifica o oponente via callback com GAME_OVER.
+        Remove também a entrada de callback armazenada.
+        """
         with self._lock:
             jogador = self.jogadores_por_cliente.pop(id_cliente, None)
-            self._resultados.pop(id_cliente, None)
-            self._chats.pop(id_cliente, None)
+            self._callbacks.pop(id_cliente, None)
             if self.partida_atual and jogador:
                 outro_id = 2 if jogador.identificador_jogador == 1 else 1
                 outro = self.partida_atual.jogadores_por_identificador.get(outro_id)
                 if outro:
-                    self._resultados[outro.identificador_cliente] = {
-                        "winner": outro.apelido,
-                        "reason": "desconexão",
-                    }
-                    self.partida_atual = None
-                    for j in self.jogadores_por_cliente.values():
-                        j.esta_pronto = True
-                    self._versao += 1
+                    uri_outro = self._callbacks.get(outro.identificador_cliente)
+                    if uri_outro:
+                        self._notificar(uri_outro, [
+                            {"type": "GAME_OVER", "payload": {
+                                "winner": outro.apelido,
+                                "reason": "desconexão",
+                            }},
+                            self._msg_lobby(),
+                        ])
+                self.partida_atual = None
+                for j in self.jogadores_por_cliente.values():
+                    j.esta_pronto = True
+                self._versao += 1
 
     # ------------------------------------------------------------------ #
     #  Lógica de jogadas — retornam List[dict] para o chamador           #
@@ -267,6 +267,7 @@ class AplicacaoServidor:
             if fim is not None:
                 return fim
 
+        self._notificar_oponente_state(jogador)
         return [self._msg_state(jogador)]
 
     def _tratar_movimentacao(
@@ -307,6 +308,7 @@ class AplicacaoServidor:
             if fim is not None:
                 return fim
 
+        self._notificar_oponente_state(jogador)
         return [self._msg_state(jogador)]
 
     def _tratar_captura(self, jogador: JogadorConectado, linha: int, coluna: int) -> List[dict]:
@@ -334,21 +336,21 @@ class AplicacaoServidor:
 
         if regras.contar_pecas_do_jogador(p.tabuleiro, id_oponente) <= 2:
             vencedor = p.jogadores_por_identificador[jogador.identificador_jogador].apelido
-            # Constrói STATE final com o tabuleiro já atualizado (peça removida)
-            # antes de encerrar a partida (que anula partida_atual).
-            estado_caller = self._msg_state(jogador)
             jogador_oponente = p.jogadores_por_identificador[id_oponente]
+            # STATE final com tabuleiro atualizado (peça removida) deve chegar
+            # ao oponente antes do GAME_OVER — passado como msgs_extras.
+            estado_caller = self._msg_state(jogador)
             estado_oponente = self._msg_state(jogador_oponente)
-            # Entrega STATE final ao oponente via buffer antes do GAME_OVER
-            self._chats.setdefault(jogador_oponente.identificador_cliente, []).append(estado_oponente)
             return [estado_caller] + self._encerrar_partida(
-                vencedor, "oponente com duas peças", jogador.identificador_cliente
+                vencedor, "oponente com duas peças", jogador.identificador_cliente,
+                msgs_extras_oponente=[estado_oponente],
             )
 
         fim = self._verificar_sem_movimentos(jogador)
         if fim is not None:
             return fim
 
+        self._notificar_oponente_state(jogador)
         return [self._msg_state(jogador)]
 
     # ------------------------------------------------------------------ #
@@ -364,31 +366,46 @@ class AplicacaoServidor:
         if not regras.existe_movimento_legal(p.tabuleiro, prox):
             vencedor_id = 2 if prox == 1 else 1
             vencedor = p.jogadores_por_identificador[vencedor_id].apelido
-            return self._encerrar_partida(vencedor, "oponente sem movimentos", jogador.identificador_cliente)
+            # Oponente (prox) recebe STATE final antes do GAME_OVER
+            jogador_prox = p.jogadores_por_identificador[prox]
+            estado_oponente = self._msg_state(jogador_prox)
+            return self._encerrar_partida(
+                vencedor, "oponente sem movimentos", jogador.identificador_cliente,
+                msgs_extras_oponente=[estado_oponente],
+            )
         return None
 
-    def _encerrar_partida(self, vencedor: str, motivo: str, id_caller: str) -> List[dict]:
+    def _encerrar_partida(
+        self,
+        vencedor: str,
+        motivo: str,
+        id_caller: str,
+        msgs_extras_oponente: Optional[List[dict]] = None,
+    ) -> List[dict]:
         """
-        Encerra a partida.
-        Retorna [GAME_OVER, LOBBY] para o chamador.
-        Registra GAME_OVER em _resultados para o outro jogador ser notificado
-        via obter_estado() no próximo poll.
+        Encerra a partida e notifica o outro jogador via callback RMI direto.
+
+        O oponente recebe: msgs_extras_oponente (ex: STATE final) + GAME_OVER + LOBBY.
+        O chamador recebe como retorno: GAME_OVER + LOBBY.
+        Não há buffer — a notificação ao oponente é uma chamada remota imediata.
         """
         game_over_payload = {"winner": vencedor, "reason": motivo}
+        game_over_msg = {"type": "GAME_OVER", "payload": game_over_payload}
+        lobby_msg = self._msg_lobby()
 
         for id_c in self._ids_da_partida():
             if id_c != id_caller:
-                self._resultados[id_c] = game_over_payload
+                uri = self._callbacks.get(id_c)
+                if uri:
+                    notif = (msgs_extras_oponente or []) + [game_over_msg, lobby_msg]
+                    self._notificar(uri, notif)
 
         self.partida_atual = None
         for j in self.jogadores_por_cliente.values():
             j.esta_pronto = True
         self._versao += 1
 
-        return [
-            {"type": "GAME_OVER", "payload": game_over_payload},
-            self._msg_lobby(),
-        ]
+        return [game_over_msg, lobby_msg]
 
     # ------------------------------------------------------------------ #
     #  Inicialização de partida                                          #
@@ -403,7 +420,49 @@ class AplicacaoServidor:
             self.partida_atual = criar_nova_partida(j1, j2)
 
     # ------------------------------------------------------------------ #
-    #  Construtores de mensagem — embutem _versao para sync do cliente   #
+    #  Notificação via callback — servidor → cliente (RMI inverso)       #
+    # ------------------------------------------------------------------ #
+
+    def _notificar(self, uri: str, msgs: List[dict]) -> None:
+        """
+        Dispara chamada RMI ao callback do cliente em thread separada.
+        Thread separada evita bloquear o _lock durante a chamada de rede.
+        Proxy criado localmente na thread — proxies Pyro5 não são thread-safe.
+        """
+        threading.Thread(
+            target=self._chamar_callback,
+            args=(uri, msgs),
+            daemon=True,
+        ).start()
+
+    def _chamar_callback(self, uri: str, msgs: List[dict]) -> None:
+        try:
+            with Pyro5.api.Proxy(uri) as cb:
+                cb.receber(msgs)
+        except Exception:
+            pass
+
+    def _notificar_oponente_state(self, jogador: JogadorConectado) -> None:
+        """Empurra STATE atualizado ao oponente via callback RMI."""
+        p = self.partida_atual
+        if not p:
+            return
+        id_oponente = 2 if jogador.identificador_jogador == 1 else 1
+        jogador_oponente = p.jogadores_por_identificador.get(id_oponente)
+        if not jogador_oponente:
+            return
+        uri = self._callbacks.get(jogador_oponente.identificador_cliente)
+        if uri:
+            self._notificar(uri, [self._msg_state(jogador_oponente)])
+
+    def _notificar_todos_exceto(self, id_caller: str, msgs: List[dict]) -> None:
+        """Notifica todos os jogadores conectados, exceto o chamador."""
+        for id_c, uri in self._callbacks.items():
+            if id_c != id_caller:
+                self._notificar(uri, msgs)
+
+    # ------------------------------------------------------------------ #
+    #  Construtores de mensagem — derivados ao vivo do estado atual       #
     # ------------------------------------------------------------------ #
 
     def _msg_state(self, jogador: JogadorConectado) -> dict:
