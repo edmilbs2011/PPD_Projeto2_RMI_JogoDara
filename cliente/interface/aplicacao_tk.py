@@ -16,7 +16,7 @@ Celula = Tuple[int, int]
 
 
 @Pyro5.api.expose
-class _ClienteCallback(InterfaceClienteCallback):
+class ClienteCallback(InterfaceClienteCallback):
     """
     Objeto de callback do cliente exposto via Pyro5.
     Registrado no servidor de nomes como 'dara.cliente.<uuid>'.
@@ -46,7 +46,7 @@ class AplicacaoTk:
 
     CONEXÃO (diálogo → servidor de nomes → proxy):
         1. Usuário informa nickname, host e porta do servidor de nomes.
-        2. Cliente cria _ClienteCallback e o registra no NS como 'dara.cliente.<uuid>'.
+        2. Cliente cria ClienteCallback e o registra no NS como 'dara.cliente.<uuid>'.
         3. Daemon Pyro5 local sobe em thread de background para receber callbacks.
         4. ns.lookup("jogo.dara") retorna a URI do daemon do jogo.
         5. proxy.hello(apelido, nome_callback) registra o jogador no servidor,
@@ -60,9 +60,9 @@ class AplicacaoTk:
         4. O retorno (STATE ou ERROR) é processado imediatamente por _processar_respostas().
 
     RECEBIMENTO (servidor → cliente, RMI inverso):
-        1. O servidor chama receber() no objeto _ClienteCallback via proxy Pyro5.
+        1. O servidor chama receber() no objeto ClienteCallback via proxy Pyro5.
         2. O Daemon local recebe a chamada na thread de background.
-        3. _ClienteCallback.receber() agenda _processar_respostas() no thread Tkinter.
+        3. ClienteCallback.receber() agenda _processar_respostas() no thread Tkinter.
         4. aplicacao_tk interpreta cada dict e atualiza a interface.
 
     Não há polling (_ciclo_rede foi removido). Toda notificação do servidor
@@ -251,7 +251,7 @@ class AplicacaoTk:
         Registra o callback no NS, sobe o Daemon local e conecta ao servidor.
 
         Fluxo:
-            1. Cria _ClienteCallback e o registra em um Daemon Pyro5 local.
+            1. Cria ClienteCallback e o registra em um Daemon Pyro5 local.
             2. Publica a URI do callback no NS como 'dara.cliente.<uuid>'.
             3. Inicia o Daemon em thread de background para receber chamadas.
             4. Resolve 'jogo.dara' no NS para obter a URI do servidor.
@@ -268,7 +268,7 @@ class AplicacaoTk:
         try:
             # Registrar callback no NS para que o servidor possa chamar de volta
             self._daemon_callback = Pyro5.api.Daemon()
-            callback = _ClienteCallback(self._raiz, self._processar_respostas)
+            callback = ClienteCallback(self._raiz, self._processar_respostas)
             uri_callback = self._daemon_callback.register(callback)
 
             ns = Pyro5.api.locate_ns(host=ns_host, port=ns_porta)

@@ -38,7 +38,16 @@ def executar() -> None:
             print(f"AVISO: não foi possível registrar no servidor de nomes: {e}")
             print(f"Clientes podem usar a URI direta: {uri}")
 
-        daemon.requestLoop()
+        try:
+            daemon.requestLoop()
+        finally:
+            try:
+                ns = Pyro5.api.locate_ns(host=args.ns_host, port=args.ns_port)
+                ns.remove("jogo.dara")
+                ns._pyroRelease()
+                print("\nRemovido do servidor de nomes.")
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
