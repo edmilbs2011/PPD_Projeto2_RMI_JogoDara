@@ -163,15 +163,13 @@ class TabuleiroCanvas(tk.Canvas):
 
         if self._nome_jogador:
             cor_jog = COR_JOGADOR_1 if self._id_jogador == 1 else COR_JOGADOR_2
-            txt_jogador = f"Você: {self._nome_jogador}"
             self.create_text(180, 14, anchor="w", fill=cor_jog,
-                             font=("Consolas", 10, "bold"), text=txt_jogador)
+                             font=("Consolas", 10, "bold"), text=f"Você: {self._nome_jogador}")
 
         if self._nome_oponente:
             cor_op = COR_JOGADOR_2 if self._id_jogador == 1 else COR_JOGADOR_1
-            txt_op = f"vs {self._nome_oponente}"
             self.create_text(380, 14, anchor="w", fill=cor_op,
-                             font=("Consolas", 10, "bold"), text=txt_op)
+                             font=("Consolas", 10, "bold"), text=f"vs {self._nome_oponente}")
 
         # Linha 2: fase e turno
         if self._fase:

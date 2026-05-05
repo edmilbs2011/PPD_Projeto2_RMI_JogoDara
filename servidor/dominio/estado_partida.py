@@ -11,6 +11,7 @@ class JogadorConectado:
     apelido: str
     identificador_jogador: int
     esta_pronto: bool = False
+    vitorias: int = 0
 
 
 @dataclass

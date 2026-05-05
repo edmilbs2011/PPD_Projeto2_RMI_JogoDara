@@ -85,6 +85,9 @@ class AplicacaoTk:
         self._ns_host: str = "localhost"
         self._ns_porta: int = 9090
 
+        # Placar da sessão {apelido: vitorias}
+        self._placar: Dict[str, int] = {}
+
         # Estado local do jogo
         self._id_jogador: int = 0
         self._apelido: str = ""
@@ -158,9 +161,39 @@ class AplicacaoTk:
         )
         self._capturas.pack(fill="x", pady=(6, 0))
 
-        # Coluna direita: log + chat
+        # Coluna direita: placar + log + chat
         col_dir = tk.Frame(corpo, bg="#f5f0e8", padx=10, pady=8)
         col_dir.pack(side="left", fill="both", expand=True)
+
+        # Placar
+        frame_placar = tk.Frame(col_dir, bg="#e8ddd2", relief="flat", bd=1)
+        frame_placar.pack(fill="x", pady=(0, 8))
+        tk.Label(frame_placar, text="Placar", bg="#e8ddd2", fg="#2c1a0e",
+                 font=("Consolas", 10, "bold")).pack(anchor="w", padx=6, pady=(4, 2))
+
+        sub_placar = tk.Frame(frame_placar, bg="#e8ddd2")
+        sub_placar.pack(fill="x", padx=6, pady=(0, 6))
+
+        col_jog = tk.Frame(sub_placar, bg="#e8ddd2")
+        col_jog.pack(side="left", expand=True, fill="x")
+        self._lbl_placar_nome_jog = tk.Label(col_jog, text="—", bg="#e8ddd2", fg="#2c1a0e",
+                                              font=("Consolas", 9, "bold"), anchor="center")
+        self._lbl_placar_nome_jog.pack(fill="x")
+        self._lbl_placar_vit_jog = tk.Label(col_jog, text="0", bg="#e8ddd2", fg="#2c1a0e",
+                                             font=("Consolas", 22, "bold"), anchor="center")
+        self._lbl_placar_vit_jog.pack(fill="x")
+
+        tk.Label(sub_placar, text="×", bg="#e8ddd2", fg="#9a8878",
+                 font=("Consolas", 14, "bold")).pack(side="left", padx=10)
+
+        col_op = tk.Frame(sub_placar, bg="#e8ddd2")
+        col_op.pack(side="left", expand=True, fill="x")
+        self._lbl_placar_nome_op = tk.Label(col_op, text="—", bg="#e8ddd2", fg="#2c1a0e",
+                                             font=("Consolas", 9, "bold"), anchor="center")
+        self._lbl_placar_nome_op.pack(fill="x")
+        self._lbl_placar_vit_op = tk.Label(col_op, text="0", bg="#e8ddd2", fg="#2c1a0e",
+                                            font=("Consolas", 22, "bold"), anchor="center")
+        self._lbl_placar_vit_op.pack(fill="x")
 
         tk.Label(col_dir, text="Log", bg="#f5f0e8", fg="#2c1a0e",
                  font=("Consolas", 10, "bold")).pack(anchor="w")
@@ -364,6 +397,9 @@ class AplicacaoTk:
         )
         self._log(f"LOBBY: {nomes}")
         self._var_status.set(f"Sala: {nomes}")
+        placar = p.get("placar", {})
+        if placar:
+            self._atualizar_placar(placar)
 
     def _ao_start(self, p: Dict) -> None:
         # O servidor não envia mais START; mantido por compatibilidade.
@@ -429,10 +465,36 @@ class AplicacaoTk:
     def _ao_game_over(self, p: Dict) -> None:
         vencedor = p.get("winner", "?")
         motivo = p.get("reason", "")
+        placar = p.get("placar", {})
         self._partida_ativa = False
+        if placar:
+            self._atualizar_placar(placar)
         self._log(f"GAME_OVER: vencedor={vencedor} motivo={motivo}")
         self._var_status.set(f"Fim de jogo! Vencedor: {vencedor}")
-        messagebox.showinfo("Fim de Jogo", f"Vencedor: {vencedor}\nMotivo: {motivo}")
+        placar_txt = ""
+        if self._placar:
+            partes = [f"{nick}: {vit}" for nick, vit in sorted(self._placar.items())]
+            placar_txt = "\n\nPlacar: " + " | ".join(partes)
+        messagebox.showinfo("Fim de Jogo", f"Vencedor: {vencedor}\nMotivo: {motivo}{placar_txt}")
+
+    def _atualizar_placar(self, placar: Dict) -> None:
+        """Atualiza o placar local e os labels do subframe."""
+        self._placar.update(placar)
+
+        nome_jog = self._apelido or "—"
+        # Oponente: qualquer entrada do placar que não seja o próprio jogador
+        nome_op = next((n for n in self._placar if n != self._apelido), None) \
+                  or self._apelido_oponente or "—"
+        vit_jog = self._placar.get(self._apelido, 0)
+        vit_op = self._placar.get(nome_op, 0)
+
+        cor_jog = "#c0392b" if self._id_jogador == 1 else "#2471a3"
+        cor_op  = "#2471a3" if self._id_jogador == 1 else "#c0392b"
+
+        self._lbl_placar_nome_jog.configure(text=nome_jog, fg=cor_jog)
+        self._lbl_placar_vit_jog.configure(text=str(vit_jog))
+        self._lbl_placar_nome_op.configure(text=nome_op, fg=cor_op)
+        self._lbl_placar_vit_op.configure(text=str(vit_op))
 
     # ================================================================== #
     #  CLIQUE NO TABULEIRO — chama métodos diretamente no servidor       #

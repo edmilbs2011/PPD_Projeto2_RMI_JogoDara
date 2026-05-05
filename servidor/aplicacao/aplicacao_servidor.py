@@ -214,12 +214,15 @@ class AplicacaoServidor(InterfaceServidor):
                 outro_id = 2 if jogador.identificador_jogador == 1 else 1
                 outro = self.partida_atual.jogadores_por_identificador.get(outro_id)
                 if outro:
+                    outro.vitorias += 1
+                    placar = self._placar_atual()
                     uri_outro = self._callbacks.get(outro.identificador_cliente)
                     if uri_outro:
                         self._notificar(uri_outro, [
                             {"type": "GAME_OVER", "payload": {
                                 "winner": outro.apelido,
                                 "reason": "desconexão",
+                                "placar": placar,
                             }},
                             self._msg_lobby(),
                         ])
@@ -389,7 +392,13 @@ class AplicacaoServidor(InterfaceServidor):
         O chamador recebe como retorno: GAME_OVER + LOBBY.
         Não há buffer — a notificação ao oponente é uma chamada remota imediata.
         """
-        game_over_payload = {"winner": vencedor, "reason": motivo}
+        # Incrementa vitória do vencedor antes de construir as mensagens
+        for j in self.jogadores_por_cliente.values():
+            if j.apelido == vencedor:
+                j.vitorias += 1
+                break
+
+        game_over_payload = {"winner": vencedor, "reason": motivo, "placar": self._placar_atual()}
         game_over_msg = {"type": "GAME_OVER", "payload": game_over_payload}
         lobby_msg = self._msg_lobby()
 
@@ -496,7 +505,12 @@ class AplicacaoServidor(InterfaceServidor):
             "players": jogadores,
             "can_start": len(jogadores) == 2,
             "versao": self._versao,
+            "placar": self._placar_atual(),
         }}
+
+    def _placar_atual(self) -> dict:
+        """Retorna dicionário {apelido: vitorias} de todos os jogadores conectados."""
+        return {j.apelido: j.vitorias for j in self.jogadores_por_cliente.values()}
 
     def _msg_erro(self, codigo: str, texto: str) -> dict:
         return {"type": "ERROR", "payload": {"code": codigo, "message": texto}}
